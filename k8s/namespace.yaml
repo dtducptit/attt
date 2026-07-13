@@ -1,0 +1,39 @@
+# ==============================================================================
+# NAMESPACE: payment-system
+# Không gian tên (Namespace) riêng biệt cho hệ thống thanh toán.
+#
+# Lý do tạo namespace riêng:
+# 1. Cách ly tài nguyên (Resource Isolation): Các pod/service của hệ thống
+#    thanh toán được tách biệt khỏi các ứng dụng khác trên cùng cluster.
+# 2. Network Policy: Có thể áp dụng chính sách mạng Zero Trust cho toàn bộ
+#    namespace, chặn mọi traffic không được phép.
+# 3. RBAC: Phân quyền truy cập theo namespace, chỉ team thanh toán mới
+#    được quản lý tài nguyên trong namespace này.
+# 4. Resource Quota: Giới hạn tài nguyên (CPU, RAM) cho toàn bộ namespace
+#    để tránh ảnh hưởng đến các hệ thống khác.
+# ==============================================================================
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: payment-system
+  labels:
+    # Label để Network Policy chọn namespace này
+    name: payment-system
+
+    # Phân loại môi trường - dùng cho policy enforcement
+    environment: production
+
+    # Đánh dấu đây là hệ thống thanh toán - tuân thủ PCI DSS
+    compliance: pci-dss
+
+    # Team sở hữu namespace này
+    team: payment-team
+
+    # Bật Istio sidecar injection nếu dùng service mesh
+    # istio-injection: enabled
+  annotations:
+    # Mô tả mục đích của namespace
+    description: "Namespace cho hệ thống thanh toán đa lớp bảo mật"
+
+    # Thông tin liên hệ khi có sự cố
+    contact: "payment-team@company.com"

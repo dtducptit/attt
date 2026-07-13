@@ -1,0 +1,84 @@
+# =============================================================================
+# Dockerfile.gateway — API Gateway Service
+# =============================================================================
+# Bảo mật multi-stage build:
+# - Stage 1 (builder): Cài đặt tất cả dependencies, build ứng dụng
+# - Stage 2 (production): Chỉ copy production code → giảm bề mặt tấn công
+# - Chạy với user non-root (node) → nguyên tắc Least Privilege
+# - Base image alpine → kích thước nhỏ, ít lỗ hổng hơn
+# =============================================================================
+
+# ---- Stage 1: Builder ----
+# Cài đặt dependencies và build ứng dụng
+FROM node:20-alpine AS builder
+
+# Metadata theo chuẩn OCI
+LABEL maintainer="Khuat Minh Hoang & Do Trong Duc"
+LABEL description="API Gateway Service - Multi-layer Security Payment System"
+LABEL version="1.0.0"
+
+# Thiết lập thư mục làm việc
+WORKDIR /app
+
+# Copy package files trước để tận dụng Docker layer caching
+# Nếu package.json không đổi → Docker cache layer này → build nhanh hơn
+COPY package.json package-lock.json ./
+
+# Cài đặt TẤT CẢ dependencies (bao gồm devDependencies cho build)
+RUN npm ci --ignore-scripts
+
+# Copy toàn bộ source code
+COPY . .
+
+# Build ứng dụng (nếu có bước build như TypeScript compilation)
+# RUN npm run build
+
+# ---- Stage 2: Production ----
+# Chỉ copy những gì cần thiết để chạy ứng dụng
+FROM node:20-alpine AS production
+
+# Cập nhật hệ thống và cài đặt các package bảo mật cần thiết
+# dumb-init: Xử lý signal đúng cách (PID 1 problem)
+RUN apk update && \
+    apk upgrade --no-cache && \
+    apk add --no-cache dumb-init && \
+    rm -rf /var/cache/apk/*
+
+# Thiết lập biến môi trường production
+ENV NODE_ENV=production
+ENV PORT=3000
+
+# Thiết lập thư mục làm việc
+WORKDIR /app
+
+# Copy CHỈ production dependencies từ stage builder
+COPY package.json package-lock.json ./
+RUN npm ci --only=production --ignore-scripts && \
+    npm cache clean --force
+
+# Copy source code từ stage builder (không bao gồm devDependencies)
+COPY --from=builder /app/src ./src
+COPY --from=builder /app/config ./config
+
+# Tạo thư mục logs với quyền phù hợp
+RUN mkdir -p /app/logs && \
+    chown -R node:node /app
+
+# ---- Bảo mật: Chuyển sang user non-root ----
+# Nguyên tắc Least Privilege: Không chạy container với quyền root
+# User 'node' được tạo sẵn trong image node:alpine (UID=1000, GID=1000)
+USER node
+
+# Expose port (chỉ mang tính documentation, không mở port thực tế)
+EXPOSE 3000
+
+# ---- Health Check ----
+# Kubernetes & Docker sử dụng health check để xác định container có hoạt động không
+# Kiểm tra endpoint /health mỗi 30 giây, timeout 10 giây, thử 3 lần
+HEALTHCHECK --interval=30s --timeout=10s --start-period=15s --retries=3 \
+  CMD ["node", "-e", "const http = require('http'); const req = http.request({hostname:'localhost',port:3000,path:'/health',timeout:5000}, (res) => { process.exit(res.statusCode === 200 ? 0 : 1); }); req.on('error', () => process.exit(1)); req.end();"]
+
+# Sử dụng dumb-init để xử lý signal gracefully (SIGTERM, SIGINT)
+# Đảm bảo Node.js process nhận được signal shutdown đúng cách
+ENTRYPOINT ["dumb-init", "--"]
+CMD ["node", "src/server.js"]

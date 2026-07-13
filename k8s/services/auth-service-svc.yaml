@@ -1,0 +1,22 @@
+# ==============================================================================
+# SERVICE: Auth Service
+# Service ClusterIP cho dịch vụ xác thực.
+# Chỉ API Gateway mới được phép gọi đến service này (qua Network Policy).
+# ==============================================================================
+apiVersion: v1
+kind: Service
+metadata:
+  name: auth-service-svc
+  namespace: payment-system
+  labels:
+    app: auth-service
+    tier: backend
+spec:
+  type: ClusterIP
+  selector:
+    app: auth-service
+  ports:
+    - name: http
+      port: 3001
+      targetPort: 3001
+      protocol: TCP

@@ -1,0 +1,151 @@
+# ==============================================================================
+# DEPLOYMENT: Auth Service
+# Dịch vụ xác thực người dùng - quản lý đăng nhập, đăng ký, phát hành JWT.
+#
+# Đây là service quan trọng nhất về bảo mật vì:
+# 1. Xử lý thông tin đăng nhập (credentials) của người dùng
+# 2. Phát hành JWT token - nếu bị compromise, toàn bộ hệ thống bị ảnh hưởng
+# 3. Lưu trữ mật khẩu đã hash - mục tiêu chính của kẻ tấn công
+#
+# Biện pháp bảo mật bổ sung:
+# - Chỉ API Gateway mới được phép gọi đến (Network Policy)
+# - ServiceAccount riêng với quyền tối thiểu
+# - Secret riêng cho khóa ký JWT (private key)
+# ==============================================================================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: auth-service
+  namespace: payment-system
+  labels:
+    app: auth-service
+    tier: backend
+    version: v1
+spec:
+  # 2 replicas để đảm bảo High Availability
+  replicas: 2
+  selector:
+    matchLabels:
+      app: auth-service
+  template:
+    metadata:
+      labels:
+        app: auth-service
+        tier: backend
+        version: v1
+    spec:
+      # ServiceAccount riêng - nguyên tắc Least Privilege
+      serviceAccountName: auth-service-sa
+      automountServiceAccountToken: false
+
+      # SecurityContext cấp Pod
+      securityContext:
+        # Chạy với user non-root để giảm thiểu rủi ro container escape
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+
+      containers:
+        - name: auth-service
+          image: registry.company.com/payment-system/auth-service:1.0.0
+          imagePullPolicy: Always
+
+          ports:
+            - containerPort: 3001
+              protocol: TCP
+              name: http
+
+          env:
+            - name: NODE_ENV
+              value: "production"
+            - name: PORT
+              value: "3001"
+            # Kết nối PostgreSQL - lấy từ Secret
+            - name: DB_HOST
+              value: "postgres-svc"
+            - name: DB_PORT
+              value: "5432"
+            - name: DB_NAME
+              value: "auth_db"
+            # Tên đăng nhập DB từ Secret (không hardcode)
+            - name: DB_USER
+              valueFrom:
+                secretKeyRef:
+                  name: db-credentials
+                  key: username
+            # Mật khẩu DB từ Secret (không hardcode)
+            - name: DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: db-credentials
+                  key: password
+            # Đường dẫn khóa bí mật JWT (dùng để KÝ token)
+            - name: JWT_PRIVATE_KEY_PATH
+              value: "/etc/secrets/jwt/private.pem"
+            # Đường dẫn khóa công khai JWT (dùng để XÁC MINH token)
+            - name: JWT_PUBLIC_KEY_PATH
+              value: "/etc/secrets/jwt/public.pem"
+
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 250m
+              memory: 256Mi
+
+          # SecurityContext cấp Container - bảo mật nghiêm ngặt
+          securityContext:
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+
+          # Liveness Probe - kiểm tra service còn hoạt động không
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 3001
+            initialDelaySeconds: 15
+            periodSeconds: 20
+            timeoutSeconds: 5
+            failureThreshold: 3
+
+          # Readiness Probe - kiểm tra service sẵn sàng nhận request chưa
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 3001
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+
+          volumeMounts:
+            # Mount CẢ private key và public key cho JWT
+            # Auth service cần private key để KÝ token
+            - name: jwt-keys
+              mountPath: /etc/secrets/jwt
+              readOnly: true
+            # Thư mục tạm (vì rootFS readOnly)
+            - name: tmp
+              mountPath: /tmp
+
+      volumes:
+        # Secret chứa cặp khóa RSA cho JWT
+        - name: jwt-keys
+          secret:
+            secretName: jwt-keys
+            # Phân quyền file: chỉ owner đọc được (0400)
+            defaultMode: 0400
+        - name: tmp
+          emptyDir:
+            sizeLimit: 50Mi
+
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0

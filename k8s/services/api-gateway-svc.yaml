@@ -1,0 +1,26 @@
+# ==============================================================================
+# SERVICE: API Gateway
+# Service ClusterIP cho API Gateway - chỉ truy cập được từ bên trong cluster.
+#
+# ClusterIP là loại service mặc định, phù hợp cho giao tiếp nội bộ.
+# Bên ngoài cluster truy cập thông qua Ingress controller.
+# ==============================================================================
+apiVersion: v1
+kind: Service
+metadata:
+  name: api-gateway-svc
+  namespace: payment-system
+  labels:
+    app: api-gateway
+    tier: gateway
+spec:
+  # ClusterIP: Chỉ truy cập nội bộ cluster
+  # Bên ngoài phải đi qua Ingress → tăng kiểm soát bảo mật
+  type: ClusterIP
+  selector:
+    app: api-gateway
+  ports:
+    - name: http
+      port: 3000
+      targetPort: 3000
+      protocol: TCP

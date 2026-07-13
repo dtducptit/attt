@@ -1,0 +1,72 @@
+# =============================================================================
+# Dockerfile.auth — Authentication Service
+# =============================================================================
+# Service xác thực và phân quyền (JWT + bcrypt)
+# Áp dụng cùng mô hình bảo mật multi-stage build như Gateway:
+# - Non-root user, minimal alpine image, production-only dependencies
+# - Port 3001 — Service xác thực người dùng
+# =============================================================================
+
+# ---- Stage 1: Builder ----
+FROM node:20-alpine AS builder
+
+LABEL maintainer="Khuat Minh Hoang & Do Trong Duc"
+LABEL description="Authentication Service - JWT & RBAC"
+LABEL version="1.0.0"
+
+WORKDIR /app
+
+# Copy package files trước để tận dụng Docker layer caching
+COPY package.json package-lock.json ./
+
+# Cài đặt tất cả dependencies (cần devDependencies cho build)
+# --ignore-scripts: Không chạy postinstall scripts để tránh mã độc
+RUN npm ci --ignore-scripts
+
+# Copy toàn bộ source code
+COPY . .
+
+# ---- Stage 2: Production ----
+FROM node:20-alpine AS production
+
+# Cập nhật và cài đặt dumb-init cho việc xử lý signal
+RUN apk update && \
+    apk upgrade --no-cache && \
+    apk add --no-cache dumb-init && \
+    rm -rf /var/cache/apk/*
+
+# Biến môi trường
+ENV NODE_ENV=production
+ENV PORT=3001
+
+WORKDIR /app
+
+# Chỉ cài đặt production dependencies
+# --ignore-scripts: Ngăn chạy scripts tùy ý từ packages
+COPY package.json package-lock.json ./
+RUN npm ci --only=production --ignore-scripts && \
+    npm cache clean --force
+
+# Copy source code từ builder stage
+COPY --from=builder /app/src ./src
+COPY --from=builder /app/config ./config
+
+# Tạo thư mục logs và đặt quyền sở hữu cho user node
+RUN mkdir -p /app/logs && \
+    chown -R node:node /app
+
+# ---- Bảo mật: User non-root ----
+# Auth Service xử lý thông tin nhạy cảm (mật khẩu, JWT secret)
+# → BẮT BUỘC chạy với user non-root để giảm thiểu thiệt hại nếu bị tấn công
+USER node
+
+# Auth Service lắng nghe trên port 3001
+EXPOSE 3001
+
+# Health check — kiểm tra service có đang hoạt động
+HEALTHCHECK --interval=30s --timeout=10s --start-period=15s --retries=3 \
+  CMD ["node", "-e", "const http = require('http'); const req = http.request({hostname:'localhost',port:3001,path:'/health',timeout:5000}, (res) => { process.exit(res.statusCode === 200 ? 0 : 1); }); req.on('error', () => process.exit(1)); req.end();"]
+
+# Sử dụng dumb-init để đảm bảo graceful shutdown
+ENTRYPOINT ["dumb-init", "--"]
+CMD ["node", "src/server.js"]

@@ -1,0 +1,171 @@
+# ==============================================================================
+# DEPLOYMENT: Payment Service
+# Dịch vụ xử lý thanh toán - quản lý giao dịch, xử lý thanh toán.
+#
+# Đây là service nhạy cảm nhất vì xử lý trực tiếp dữ liệu thanh toán.
+# Tuân thủ PCI DSS yêu cầu:
+# - Mã hóa dữ liệu thẻ khi lưu trữ (AES-256)
+# - Giới hạn truy cập chỉ cho người/service có nhu cầu
+# - Ghi log mọi truy cập vào dữ liệu thanh toán
+#
+# Biện pháp bảo mật đặc biệt:
+# 1. Mount Sealed Secret cho khóa mã hóa AES-256
+# 2. Network Policy: CHỈ gateway mới gọi được, KHÔNG gọi được auth-service
+# 3. Mã hóa dữ liệu nhạy cảm trước khi lưu vào DB
+# ==============================================================================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: payment-service
+  namespace: payment-system
+  labels:
+    app: payment-service
+    tier: backend
+    version: v1
+    # Label đánh dấu service xử lý dữ liệu nhạy cảm
+    data-sensitivity: high
+spec:
+  # 2 replicas cho High Availability
+  replicas: 2
+  selector:
+    matchLabels:
+      app: payment-service
+  template:
+    metadata:
+      labels:
+        app: payment-service
+        tier: backend
+        version: v1
+        data-sensitivity: high
+    spec:
+      # ServiceAccount riêng cho Payment Service
+      serviceAccountName: payment-service-sa
+      automountServiceAccountToken: false
+
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+
+      containers:
+        - name: payment-service
+          image: registry.company.com/payment-system/payment-service:1.0.0
+          imagePullPolicy: Always
+
+          ports:
+            - containerPort: 3002
+              protocol: TCP
+              name: http
+
+          env:
+            - name: NODE_ENV
+              value: "production"
+            - name: PORT
+              value: "3002"
+            # Kết nối PostgreSQL
+            - name: DB_HOST
+              value: "postgres-svc"
+            - name: DB_PORT
+              value: "5432"
+            - name: DB_NAME
+              value: "payment_db"
+            # Thông tin đăng nhập DB từ Secret
+            - name: DB_USER
+              valueFrom:
+                secretKeyRef:
+                  name: db-credentials
+                  key: username
+            - name: DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: db-credentials
+                  key: password
+            # Đường dẫn khóa mã hóa AES-256 (mount từ Sealed Secret)
+            # Dùng để mã hóa/giải mã dữ liệu thanh toán nhạy cảm
+            - name: ENCRYPTION_KEY_PATH
+              value: "/etc/secrets/encryption/aes-key"
+            # Đường dẫn khóa công khai JWT (chỉ cần verify, không cần sign)
+            - name: JWT_PUBLIC_KEY_PATH
+              value: "/etc/secrets/jwt/public.pem"
+
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 250m
+              memory: 256Mi
+
+          securityContext:
+            # Filesystem chỉ đọc - bảo vệ tính toàn vẹn của container
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 3002
+            initialDelaySeconds: 15
+            periodSeconds: 20
+            timeoutSeconds: 5
+            failureThreshold: 3
+
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 3002
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+
+          volumeMounts:
+            # ================================================================
+            # SEALED SECRETS MOUNT
+            # Khóa mã hóa AES-256 được quản lý bởi Sealed Secrets controller.
+            #
+            # Sealed Secrets đảm bảo:
+            # 1. Khóa được mã hóa trong Git (SealedSecret resource)
+            # 2. Chỉ Sealed Secrets controller mới giải mã được
+            # 3. Kết quả là Kubernetes Secret bình thường, mount vào pod
+            # ================================================================
+            - name: encryption-keys
+              mountPath: /etc/secrets/encryption
+              readOnly: true
+            # Khóa công khai JWT để xác minh token nội bộ (nếu cần)
+            - name: jwt-public-key
+              mountPath: /etc/secrets/jwt
+              readOnly: true
+            # Thư mục tạm
+            - name: tmp
+              mountPath: /tmp
+
+      volumes:
+        # Secret chứa khóa mã hóa AES-256
+        # Được tạo tự động bởi Sealed Secrets controller từ SealedSecret resource
+        - name: encryption-keys
+          secret:
+            secretName: payment-encryption-keys
+            # Chỉ owner đọc được - bảo vệ khóa mã hóa
+            defaultMode: 0400
+        # Khóa công khai JWT
+        - name: jwt-public-key
+          secret:
+            secretName: jwt-keys
+            items:
+              - key: public.pem
+                path: public.pem
+            defaultMode: 0444
+        - name: tmp
+          emptyDir:
+            sizeLimit: 50Mi
+
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0

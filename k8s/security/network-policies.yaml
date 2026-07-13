@@ -1,0 +1,424 @@
+# ==============================================================================
+# NETWORK POLICIES - ZERO TRUST
+# Chính sách mạng Zero Trust cho hệ thống thanh toán.
+#
+# ╔══════════════════════════════════════════════════════════════════════════╗
+# ║                    NGUYÊN TẮC ZERO TRUST                               ║
+# ║                                                                        ║
+# ║  "Never trust, always verify" - Không bao giờ tin tưởng, luôn xác minh ║
+# ║                                                                        ║
+# ║  Trong mô hình Zero Trust:                                             ║
+# ║  1. MẶC ĐỊNH TỪ CHỐI TẤT CẢ (Default Deny All)                       ║
+# ║     → Mọi traffic bị chặn trừ khi được cho phép rõ ràng               ║
+# ║  2. NGUYÊN TẮC ĐẶC QUYỀN TỐI THIỂU (Least Privilege)                ║
+# ║     → Mỗi service chỉ được phép giao tiếp với service cần thiết       ║
+# ║  3. MICRO-SEGMENTATION                                                 ║
+# ║     → Mỗi service có chính sách mạng riêng biệt                       ║
+# ║  4. XÁC MINH LIÊN TỤC (Continuous Verification)                       ║
+# ║     → Network Policy được enforce bởi CNI plugin (Calico, Cilium)      ║
+# ║                                                                        ║
+# ║  Sơ đồ luồng cho phép:                                                ║
+# ║                                                                        ║
+# ║  Internet → Ingress → [API Gateway] → [Auth Service] → [PostgreSQL]   ║
+# ║                              │                                         ║
+# ║                              └──→ [Payment Service] → [PostgreSQL]     ║
+# ║                                                                        ║
+# ║  ❌ Payment Service ←✕→ Auth Service (CHẶN giao tiếp trực tiếp)       ║
+# ║  ❌ Mọi traffic khác đều bị CHẶN mặc định                             ║
+# ╚══════════════════════════════════════════════════════════════════════════╝
+# ==============================================================================
+
+---
+# ==============================================================================
+# POLICY 1: DEFAULT DENY ALL
+# Chặn TẤT CẢ ingress (vào) và egress (ra) trong namespace payment-system.
+#
+# Đây là nền tảng của Zero Trust - bắt đầu từ trạng thái "chặn tất cả",
+# sau đó chỉ mở những gì cần thiết.
+#
+# Tại sao cần cả ingress VÀ egress deny?
+# - Ingress deny: Chặn mọi kết nối ĐẾN các pod
+# - Egress deny: Chặn mọi kết nối TỪ các pod ĐI RA
+# - Nếu chỉ deny ingress, pod bị compromise vẫn có thể gửi dữ liệu ra ngoài
+#   (data exfiltration) → phải deny cả egress
+# ==============================================================================
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-all
+  namespace: payment-system
+  labels:
+    policy-type: default-deny
+  annotations:
+    description: "Chặn mặc định TẤT CẢ traffic ingress và egress trong namespace"
+spec:
+  # podSelector rỗng {} → áp dụng cho TẤT CẢ pod trong namespace
+  podSelector: {}
+  # Áp dụng cho cả ingress và egress
+  policyTypes:
+    - Ingress
+    - Egress
+  # Không có rule ingress/egress → tất cả đều bị chặn
+
+---
+# ==============================================================================
+# POLICY 2: ALLOW GATEWAY TO AUTH SERVICE
+# Cho phép API Gateway gửi request đến Auth Service.
+#
+# Luồng: API Gateway (port bất kỳ) → Auth Service (port 3001)
+#
+# Tại sao cần policy này?
+# - Gateway cần chuyển tiếp request đăng nhập/đăng ký đến Auth Service
+# - Chỉ Gateway mới được phép gọi Auth Service, không phải service khác
+# - Nếu Payment Service bị compromise, kẻ tấn công KHÔNG thể gọi Auth Service
+#   để tạo token giả hoặc đổi mật khẩu
+# ==============================================================================
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-gateway-to-auth
+  namespace: payment-system
+  labels:
+    policy-type: allow
+    source: api-gateway
+    destination: auth-service
+  annotations:
+    description: "Cho phép API Gateway gọi Auth Service trên port 3001"
+spec:
+  # Áp dụng cho pod có label app=auth-service
+  podSelector:
+    matchLabels:
+      app: auth-service
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        # Chỉ chấp nhận traffic từ pod có label app=api-gateway
+        - podSelector:
+            matchLabels:
+              app: api-gateway
+      ports:
+        # Chỉ cho phép truy cập port 3001 (HTTP API của Auth Service)
+        # KHÔNG mở port khác → giảm bề mặt tấn công
+        - protocol: TCP
+          port: 3001
+
+---
+# ==============================================================================
+# POLICY 3: ALLOW GATEWAY TO PAYMENT SERVICE
+# Cho phép API Gateway gửi request đến Payment Service.
+#
+# Luồng: API Gateway → Payment Service (port 3002)
+#
+# Lý do:
+# - Gateway đã xác thực JWT trước khi chuyển tiếp → Payment Service
+#   tin tưởng request từ Gateway đã được xác thực
+# - Payment Service chỉ nhận request từ Gateway, KHÔNG nhận từ bên ngoài
+# ==============================================================================
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-gateway-to-payment
+  namespace: payment-system
+  labels:
+    policy-type: allow
+    source: api-gateway
+    destination: payment-service
+  annotations:
+    description: "Cho phép API Gateway gọi Payment Service trên port 3002"
+spec:
+  podSelector:
+    matchLabels:
+      app: payment-service
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: api-gateway
+      ports:
+        - protocol: TCP
+          port: 3002
+
+---
+# ==============================================================================
+# POLICY 4: ALLOW PAYMENT SERVICE TO POSTGRESQL
+# Cho phép Payment Service kết nối đến PostgreSQL.
+#
+# Luồng: Payment Service → PostgreSQL (port 5432)
+#
+# Tại sao chỉ cho phép port 5432?
+# - PostgreSQL chỉ lắng nghe trên port 5432
+# - Nếu mở thêm port, kẻ tấn công có thể khai thác qua port khác
+# - Nguyên tắc Least Privilege: chỉ mở những gì cần thiết
+# ==============================================================================
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-payment-to-postgres
+  namespace: payment-system
+  labels:
+    policy-type: allow
+    source: payment-service
+    destination: postgres
+  annotations:
+    description: "Cho phép Payment Service kết nối PostgreSQL trên port 5432"
+spec:
+  podSelector:
+    matchLabels:
+      app: postgres
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: payment-service
+      ports:
+        - protocol: TCP
+          port: 5432
+
+---
+# ==============================================================================
+# POLICY 5: ALLOW AUTH SERVICE TO POSTGRESQL
+# Cho phép Auth Service kết nối đến PostgreSQL.
+#
+# Luồng: Auth Service → PostgreSQL (port 5432)
+#
+# Auth Service cần kết nối DB để:
+# - Xác minh thông tin đăng nhập (kiểm tra username/password hash)
+# - Tạo tài khoản mới (INSERT user)
+# - Quản lý refresh token
+# ==============================================================================
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-auth-to-postgres
+  namespace: payment-system
+  labels:
+    policy-type: allow
+    source: auth-service
+    destination: postgres
+  annotations:
+    description: "Cho phép Auth Service kết nối PostgreSQL trên port 5432"
+spec:
+  podSelector:
+    matchLabels:
+      app: postgres
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: auth-service
+      ports:
+        - protocol: TCP
+          port: 5432
+
+---
+# ==============================================================================
+# POLICY 6: DENY PAYMENT TO AUTH (EXPLICIT BLOCK)
+# Chặn RÕNG RÀNG giao tiếp trực tiếp giữa Payment Service và Auth Service.
+#
+# ⚠️  Tại sao cần policy này khi đã có default-deny?
+#
+# 1. DEFENSE IN DEPTH (Phòng thủ theo chiều sâu):
+#    - Default-deny là lớp bảo vệ đầu tiên
+#    - Policy này là lớp bảo vệ thứ hai, phòng trường hợp default-deny
+#      bị vô hiệu hóa do lỗi cấu hình
+#
+# 2. DOCUMENTATION (Tài liệu hóa ý định):
+#    - Ghi rõ ràng trong manifest rằng Payment ↔ Auth KHÔNG ĐƯỢC giao tiếp
+#    - Khi review cấu hình, người đọc hiểu ngay ý đồ thiết kế
+#
+# 3. TẠI SAO CHẶN Payment ↔ Auth?
+#    - Payment Service KHÔNG cần gọi Auth Service vì:
+#      + JWT đã được Gateway xác thực → thông tin user truyền qua header
+#      + Nếu Payment gọi được Auth → kẻ tấn công có thể tạo token giả
+#      + Vi phạm nguyên tắc "Separation of Concerns"
+#    - Auth Service KHÔNG cần gọi Payment Service vì:
+#      + Xác thực và thanh toán là hai chức năng độc lập
+#      + Ghép nối lỏng (loose coupling) giữa các service
+#
+# 4. NGĂN CHẶN LATERAL MOVEMENT (Di chuyển ngang):
+#    - Nếu 1 service bị compromise, kẻ tấn công không thể "nhảy" sang
+#      service khác → giới hạn phạm vi thiệt hại (blast radius)
+# ==============================================================================
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: deny-payment-to-auth
+  namespace: payment-system
+  labels:
+    policy-type: explicit-deny
+    security-reason: lateral-movement-prevention
+  annotations:
+    description: |
+      CHẶN RÕ RÀNG giao tiếp trực tiếp giữa Payment Service và Auth Service.
+      Đây là lớp bảo vệ bổ sung (Defense in Depth) bên cạnh default-deny.
+      Ngăn chặn lateral movement nếu 1 service bị compromise.
+spec:
+  # Áp dụng cho Payment Service
+  podSelector:
+    matchLabels:
+      app: payment-service
+  policyTypes:
+    - Egress
+  # Chỉ cho phép egress đến PostgreSQL, CHẶN mọi thứ khác (bao gồm Auth)
+  egress:
+    # Cho phép kết nối đến PostgreSQL (duy nhất)
+    - to:
+        - podSelector:
+            matchLabels:
+              app: postgres
+      ports:
+        - protocol: TCP
+          port: 5432
+    # Cho phép DNS resolution (cần thiết để resolve tên service)
+    # Nếu không có rule này, pod không thể resolve postgres-svc thành IP
+    - to:
+        - namespaceSelector: {}
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+
+---
+# ==============================================================================
+# POLICY 7: ALLOW EGRESS FROM AUTH SERVICE
+# Cho phép Auth Service gửi traffic ra ngoài (chỉ đến PostgreSQL và DNS).
+#
+# Tương tự như Policy 6 nhưng cho Auth Service.
+# Auth Service CHỈ ĐƯỢC kết nối đến PostgreSQL, KHÔNG được gọi Payment Service.
+# ==============================================================================
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-auth-egress
+  namespace: payment-system
+  labels:
+    policy-type: allow
+    source: auth-service
+  annotations:
+    description: "Cho phép Auth Service kết nối đến PostgreSQL và DNS"
+spec:
+  podSelector:
+    matchLabels:
+      app: auth-service
+  policyTypes:
+    - Egress
+  egress:
+    # Chỉ cho phép kết nối đến PostgreSQL
+    - to:
+        - podSelector:
+            matchLabels:
+              app: postgres
+      ports:
+        - protocol: TCP
+          port: 5432
+    # Cho phép DNS resolution
+    - to:
+        - namespaceSelector: {}
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+
+---
+# ==============================================================================
+# POLICY 8: ALLOW EGRESS FROM API GATEWAY
+# Cho phép API Gateway gửi traffic đến Auth Service và Payment Service.
+#
+# Gateway cần giao tiếp với cả hai backend service để proxy request.
+# Tuy nhiên, Gateway KHÔNG được kết nối trực tiếp đến PostgreSQL
+# → tuân thủ nguyên tắc không truy cập DB trực tiếp từ gateway layer.
+# ==============================================================================
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-gateway-egress
+  namespace: payment-system
+  labels:
+    policy-type: allow
+    source: api-gateway
+  annotations:
+    description: "Cho phép API Gateway gọi Auth Service và Payment Service"
+spec:
+  podSelector:
+    matchLabels:
+      app: api-gateway
+  policyTypes:
+    - Egress
+  egress:
+    # Cho phép kết nối đến Auth Service
+    - to:
+        - podSelector:
+            matchLabels:
+              app: auth-service
+      ports:
+        - protocol: TCP
+          port: 3001
+    # Cho phép kết nối đến Payment Service
+    - to:
+        - podSelector:
+            matchLabels:
+              app: payment-service
+      ports:
+        - protocol: TCP
+          port: 3002
+    # Cho phép DNS resolution
+    - to:
+        - namespaceSelector: {}
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+
+---
+# ==============================================================================
+# POLICY 9: ALLOW INGRESS TO API GATEWAY FROM INGRESS CONTROLLER
+# Cho phép Ingress Controller gửi traffic đến API Gateway.
+#
+# Đây là điểm vào DUY NHẤT từ bên ngoài vào hệ thống.
+# Ingress Controller thường nằm ở namespace ingress-nginx hoặc tương tự.
+# ==============================================================================
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-ingress-to-gateway
+  namespace: payment-system
+  labels:
+    policy-type: allow
+    source: ingress-controller
+    destination: api-gateway
+  annotations:
+    description: "Cho phép Ingress Controller gửi traffic đến API Gateway"
+spec:
+  podSelector:
+    matchLabels:
+      app: api-gateway
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        # Cho phép traffic từ namespace chứa Ingress Controller
+        - namespaceSelector:
+            matchLabels:
+              name: ingress-nginx
+      ports:
+        - protocol: TCP
+          port: 3000

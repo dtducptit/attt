@@ -1,0 +1,190 @@
+# ==============================================================================
+# DEPLOYMENT: API Gateway
+# Triển khai API Gateway với 2 bản sao (replicas) để đảm bảo tính sẵn sàng cao.
+#
+# Các biện pháp bảo mật được áp dụng:
+# 1. SecurityContext: Chạy với quyền non-root, filesystem chỉ đọc
+# 2. Resource Limits: Giới hạn CPU/RAM để chống tấn công resource exhaustion
+# 3. Liveness/Readiness Probes: Tự động khởi động lại pod lỗi
+# 4. ServiceAccount riêng: Tuân thủ nguyên tắc Least Privilege
+# 5. Drop ALL capabilities: Loại bỏ mọi Linux capabilities không cần thiết
+# ==============================================================================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api-gateway
+  namespace: payment-system
+  labels:
+    app: api-gateway
+    tier: gateway
+    version: v1
+spec:
+  # 2 replicas để đảm bảo High Availability
+  # Nếu 1 pod bị lỗi, pod còn lại vẫn phục vụ request
+  replicas: 2
+  selector:
+    matchLabels:
+      app: api-gateway
+  template:
+    metadata:
+      labels:
+        app: api-gateway
+        tier: gateway
+        version: v1
+    spec:
+      # ServiceAccount riêng cho API Gateway
+      # Mỗi service có ServiceAccount riêng → nguyên tắc Least Privilege
+      # Nếu 1 service bị compromise, kẻ tấn công không thể dùng quyền của service khác
+      serviceAccountName: api-gateway-sa
+
+      # Không tự động mount ServiceAccount token vào pod
+      # Chỉ mount khi service thực sự cần gọi Kubernetes API
+      automountServiceAccountToken: false
+
+      # SecurityContext cấp Pod - áp dụng cho TẤT CẢ container trong pod
+      securityContext:
+        # Bắt buộc chạy với user non-root
+        # Ngăn chặn kẻ tấn công leo thang quyền nếu exploit được container
+        runAsNonRoot: true
+
+        # Chạy với UID 1000 (user thường, không phải root UID=0)
+        runAsUser: 1000
+
+        # Group ID cho filesystem
+        runAsGroup: 1000
+
+        # Đảm bảo volume được mount với đúng group
+        fsGroup: 1000
+
+      containers:
+        - name: api-gateway
+          # Image từ registry nội bộ - KHÔNG dùng tag :latest trong production
+          # Tag cụ thể giúp rollback chính xác khi có sự cố
+          image: registry.company.com/payment-system/api-gateway:1.0.0
+
+          # Luôn kéo image mới nhất để đảm bảo patch bảo mật
+          imagePullPolicy: Always
+
+          ports:
+            - containerPort: 3000
+              protocol: TCP
+              name: http
+
+          # Biến môi trường cấu hình
+          env:
+            - name: NODE_ENV
+              value: "production"
+            - name: PORT
+              value: "3000"
+            # URL các service nội bộ - dùng tên DNS Kubernetes
+            - name: AUTH_SERVICE_URL
+              value: "http://auth-service-svc:3001"
+            - name: PAYMENT_SERVICE_URL
+              value: "http://payment-service-svc:3002"
+            # Đường dẫn khóa công khai JWT (mount từ Secret)
+            - name: JWT_PUBLIC_KEY_PATH
+              value: "/etc/secrets/jwt/public.pem"
+
+          # ==================================================================
+          # RESOURCE LIMITS
+          # Giới hạn tài nguyên để:
+          # 1. Chống tấn công Resource Exhaustion / DoS
+          # 2. Đảm bảo công bằng tài nguyên giữa các pod
+          # 3. Kubernetes scheduler cần limits để lên lịch hiệu quả
+          # ==================================================================
+          resources:
+            # Request: Tài nguyên TỐI THIỂU được đảm bảo
+            requests:
+              cpu: 100m      # 0.1 CPU core
+              memory: 128Mi  # 128 MB RAM
+            # Limits: Tài nguyên TỐI ĐA được phép sử dụng
+            # Vượt quá CPU → bị throttle, vượt quá RAM → bị OOM kill
+            limits:
+              cpu: 250m      # 0.25 CPU core
+              memory: 256Mi  # 256 MB RAM
+
+          # ==================================================================
+          # SECURITY CONTEXT cấp Container
+          # Áp dụng các hạn chế bảo mật bổ sung cho container này
+          # ==================================================================
+          securityContext:
+            # Filesystem chỉ đọc - ngăn kẻ tấn công ghi file độc hại
+            # Nếu cần ghi file (log, temp), mount emptyDir volume riêng
+            readOnlyRootFilesystem: true
+
+            # Không cho phép leo thang quyền (privilege escalation)
+            # Chặn setuid/setgid binaries
+            allowPrivilegeEscalation: false
+
+            # Loại bỏ TẤT CẢ Linux capabilities
+            # Container chỉ cần chạy Node.js, không cần bất kỳ capability nào
+            capabilities:
+              drop:
+                - ALL
+
+          # ==================================================================
+          # LIVENESS PROBE
+          # Kubernetes sẽ khởi động lại pod nếu probe thất bại liên tục.
+          # Đảm bảo pod "sống" và có thể xử lý request.
+          # ==================================================================
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 3000
+            # Chờ 15 giây trước khi bắt đầu kiểm tra (cho app khởi động)
+            initialDelaySeconds: 15
+            # Kiểm tra mỗi 20 giây
+            periodSeconds: 20
+            # Timeout cho mỗi lần kiểm tra
+            timeoutSeconds: 5
+            # Số lần thất bại liên tiếp trước khi restart pod
+            failureThreshold: 3
+
+          # ==================================================================
+          # READINESS PROBE
+          # Kubernetes sẽ KHÔNG gửi traffic đến pod nếu probe thất bại.
+          # Đảm bảo pod "sẵn sàng" trước khi nhận request.
+          # ==================================================================
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 3000
+            # Bắt đầu kiểm tra sớm hơn liveness
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+
+          # Mount volume cho khóa JWT (từ Secret) và thư mục tạm
+          volumeMounts:
+            # Khóa công khai JWT - mount từ Kubernetes Secret
+            - name: jwt-public-key
+              mountPath: /etc/secrets/jwt
+              readOnly: true
+            # Thư mục tạm cho Node.js (vì rootFS là readOnly)
+            - name: tmp
+              mountPath: /tmp
+
+      volumes:
+        # Secret chứa khóa công khai JWT
+        - name: jwt-public-key
+          secret:
+            secretName: jwt-keys
+            items:
+              - key: public.pem
+                path: public.pem
+        # emptyDir cho thư mục tạm - bị xóa khi pod dừng
+        - name: tmp
+          emptyDir:
+            # Giới hạn kích thước thư mục tạm - chống ghi đầy disk
+            sizeLimit: 50Mi
+
+  # Chiến lược cập nhật Rolling Update
+  # Đảm bảo không có downtime khi deploy phiên bản mới
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      # Cho phép tạo thêm 1 pod mới trước khi xóa pod cũ
+      maxSurge: 1
+      # Luôn giữ ít nhất 1 pod hoạt động
+      maxUnavailable: 0

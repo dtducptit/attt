@@ -1,0 +1,71 @@
+# =============================================================================
+# Dockerfile.payment — Payment Service
+# =============================================================================
+# Service xử lý thanh toán — chứa dữ liệu TÀI CHÍNH nhạy cảm nhất
+# Áp dụng bảo mật NGHIÊM NGẶT nhất:
+# - Multi-stage build, non-root user, minimal image
+# - Mã hóa AES-256-GCM cho dữ liệu thẻ tín dụng
+# - Port 3002
+# =============================================================================
+
+# ---- Stage 1: Builder ----
+FROM node:20-alpine AS builder
+
+LABEL maintainer="Khuat Minh Hoang & Do Trong Duc"
+LABEL description="Payment Service - AES-256-GCM Encryption"
+LABEL version="1.0.0"
+
+WORKDIR /app
+
+# Copy package files trước để tận dụng Docker layer caching
+COPY package.json package-lock.json ./
+
+# Cài đặt dependencies — --ignore-scripts để ngăn chạy mã tùy ý
+RUN npm ci --ignore-scripts
+
+# Copy source code
+COPY . .
+
+# ---- Stage 2: Production ----
+FROM node:20-alpine AS production
+
+# Cập nhật hệ thống và cài đặt dumb-init
+RUN apk update && \
+    apk upgrade --no-cache && \
+    apk add --no-cache dumb-init && \
+    rm -rf /var/cache/apk/*
+
+# Biến môi trường
+ENV NODE_ENV=production
+ENV PORT=3002
+
+WORKDIR /app
+
+# Chỉ cài đặt production dependencies
+COPY package.json package-lock.json ./
+RUN npm ci --only=production --ignore-scripts && \
+    npm cache clean --force
+
+# Copy source code từ builder
+COPY --from=builder /app/src ./src
+COPY --from=builder /app/config ./config
+
+# Tạo thư mục logs
+RUN mkdir -p /app/logs && \
+    chown -R node:node /app
+
+# ---- Bảo mật: User non-root ----
+# Payment Service xử lý thông tin THẺ TÍN DỤNG, SỐ TÀI KHOẢN
+# → Mức bảo mật CAO NHẤT — không bao giờ chạy với root
+USER node
+
+# Payment Service lắng nghe trên port 3002
+EXPOSE 3002
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=10s --start-period=15s --retries=3 \
+  CMD ["node", "-e", "const http = require('http'); const req = http.request({hostname:'localhost',port:3002,path:'/health',timeout:5000}, (res) => { process.exit(res.statusCode === 200 ? 0 : 1); }); req.on('error', () => process.exit(1)); req.end();"]
+
+# Graceful shutdown với dumb-init
+ENTRYPOINT ["dumb-init", "--"]
+CMD ["node", "src/server.js"]

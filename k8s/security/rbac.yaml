@@ -1,0 +1,271 @@
+# ==============================================================================
+# RBAC - Role-Based Access Control
+# Kiểm soát truy cập dựa trên vai trò cho hệ thống thanh toán.
+#
+# ╔══════════════════════════════════════════════════════════════════════════╗
+# ║                    NGUYÊN TẮC RBAC                                     ║
+# ║                                                                        ║
+# ║  1. LEAST PRIVILEGE (Đặc quyền tối thiểu):                            ║
+# ║     → Mỗi ServiceAccount chỉ có quyền TỐI THIỂU cần thiết            ║
+# ║     → Không dùng ServiceAccount mặc định (default)                     ║
+# ║                                                                        ║
+# ║  2. SEPARATION OF DUTIES (Tách biệt nhiệm vụ):                       ║
+# ║     → Mỗi service có ServiceAccount riêng                              ║
+# ║     → Không chia sẻ ServiceAccount giữa các service                    ║
+# ║                                                                        ║
+# ║  3. DEFENSE IN DEPTH (Phòng thủ theo chiều sâu):                      ║
+# ║     → RBAC là lớp bảo mật bổ sung bên cạnh Network Policy             ║
+# ║     → Ngay cả khi network policy bị bypass, RBAC vẫn bảo vệ           ║
+# ╚══════════════════════════════════════════════════════════════════════════╝
+# ==============================================================================
+
+---
+# ==============================================================================
+# SERVICE ACCOUNTS
+# Tài khoản dịch vụ riêng cho mỗi microservice.
+#
+# Tại sao không dùng ServiceAccount mặc định (default)?
+# - SA mặc định có thể bị khai thác nếu 1 pod bị compromise
+# - SA mặc định thường có quyền rộng hơn cần thiết
+# - Không thể phân biệt traffic từ service nào khi audit
+# - SA riêng giúp Network Policy và RBAC hoạt động chính xác
+# ==============================================================================
+
+# ServiceAccount cho API Gateway
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: api-gateway-sa
+  namespace: payment-system
+  labels:
+    app: api-gateway
+    tier: gateway
+  annotations:
+    description: "ServiceAccount cho API Gateway - quyền tối thiểu, chỉ đọc ConfigMap"
+# Không tự động mount token - Gateway không cần gọi K8s API
+automountServiceAccountToken: false
+
+---
+# ServiceAccount cho Auth Service
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: auth-service-sa
+  namespace: payment-system
+  labels:
+    app: auth-service
+    tier: backend
+  annotations:
+    description: "ServiceAccount cho Auth Service - quyền đọc Secret để lấy khóa JWT"
+automountServiceAccountToken: false
+
+---
+# ServiceAccount cho Payment Service
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: payment-service-sa
+  namespace: payment-system
+  labels:
+    app: payment-service
+    tier: backend
+  annotations:
+    description: "ServiceAccount cho Payment Service - quyền đọc Secret để lấy khóa mã hóa"
+automountServiceAccountToken: false
+
+---
+# ==============================================================================
+# ROLES
+# Vai trò (Role) xác định TẬP HỢP QUYỀN trong phạm vi namespace.
+#
+# Role vs ClusterRole:
+# - Role: Quyền trong 1 namespace cụ thể → an toàn hơn
+# - ClusterRole: Quyền trên toàn bộ cluster → chỉ dùng cho monitoring
+#
+# Nguyên tắc: Luôn dùng Role (namespace-scoped) trước,
+# chỉ dùng ClusterRole khi thực sự cần truy cập cross-namespace.
+# ==============================================================================
+
+# Role cho API Gateway - chỉ đọc ConfigMap
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: api-gateway-role
+  namespace: payment-system
+  labels:
+    app: api-gateway
+rules:
+  # Cho phép đọc ConfigMap (cấu hình routing, CORS, etc.)
+  # KHÔNG cho phép tạo/sửa/xóa ConfigMap
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get", "list", "watch"]
+    # Giới hạn chỉ đọc ConfigMap cụ thể (tùy chọn)
+    # resourceNames: ["api-gateway-config"]
+
+---
+# Role cho Auth Service - đọc Secret chứa khóa JWT
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: auth-service-role
+  namespace: payment-system
+  labels:
+    app: auth-service
+rules:
+  # Cho phép đọc Secret (khóa JWT, DB credentials)
+  # Chỉ đọc (get), KHÔNG liệt kê (list) để tránh lộ tên các Secret khác
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get"]
+    # Giới hạn chỉ đọc Secret cụ thể - nguyên tắc Least Privilege
+    resourceNames: ["jwt-keys", "db-credentials"]
+  # Cho phép đọc ConfigMap
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get", "list", "watch"]
+
+---
+# Role cho Payment Service - đọc Secret chứa khóa mã hóa
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: payment-service-role
+  namespace: payment-system
+  labels:
+    app: payment-service
+rules:
+  # Cho phép đọc Secret (khóa mã hóa AES, DB credentials)
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get"]
+    # Chỉ đọc Secret cụ thể - KHÔNG đọc được jwt-keys private key
+    # Payment Service chỉ cần khóa công khai JWT (đã mount trong deployment)
+    resourceNames: ["payment-encryption-keys", "db-credentials"]
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get", "list", "watch"]
+
+---
+# ==============================================================================
+# ROLE BINDINGS
+# Gắn kết (bind) Role với ServiceAccount.
+#
+# RoleBinding xác định: "ServiceAccount X có quyền của Role Y"
+# Mỗi service chỉ được gắn với Role tương ứng của nó.
+# ==============================================================================
+
+# Gắn api-gateway-role cho api-gateway-sa
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: api-gateway-binding
+  namespace: payment-system
+  labels:
+    app: api-gateway
+subjects:
+  - kind: ServiceAccount
+    name: api-gateway-sa
+    namespace: payment-system
+roleRef:
+  kind: Role
+  name: api-gateway-role
+  apiGroup: rbac.authorization.k8s.io
+
+---
+# Gắn auth-service-role cho auth-service-sa
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: auth-service-binding
+  namespace: payment-system
+  labels:
+    app: auth-service
+subjects:
+  - kind: ServiceAccount
+    name: auth-service-sa
+    namespace: payment-system
+roleRef:
+  kind: Role
+  name: auth-service-role
+  apiGroup: rbac.authorization.k8s.io
+
+---
+# Gắn payment-service-role cho payment-service-sa
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: payment-service-binding
+  namespace: payment-system
+  labels:
+    app: payment-service
+subjects:
+  - kind: ServiceAccount
+    name: payment-service-sa
+    namespace: payment-system
+roleRef:
+  kind: Role
+  name: payment-service-role
+  apiGroup: rbac.authorization.k8s.io
+
+---
+# ==============================================================================
+# CLUSTER ROLE - READ-ONLY MONITORING
+# Vai trò cấp cluster cho hệ thống giám sát (Prometheus, Grafana, etc.)
+#
+# ClusterRole này cho phép ĐỌC thông tin từ mọi namespace:
+# - Pods, Services, Endpoints: Để phát hiện service tự động
+# - Nodes: Để giám sát tài nguyên cluster
+# - Metrics: Để thu thập số liệu hiệu suất
+#
+# Tại sao dùng ClusterRole thay vì Role?
+# - Monitoring cần truy cập cross-namespace
+# - Chỉ có quyền ĐỌC (read-only), KHÔNG có quyền sửa/xóa
+# - Tuân thủ nguyên tắc Least Privilege cho monitoring
+# ==============================================================================
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: payment-system-monitoring
+  labels:
+    purpose: monitoring
+    system: payment
+rules:
+  # Đọc thông tin pod (trạng thái, log, metrics)
+  - apiGroups: [""]
+    resources: ["pods", "pods/log"]
+    verbs: ["get", "list", "watch"]
+  # Đọc thông tin service và endpoint (service discovery)
+  - apiGroups: [""]
+    resources: ["services", "endpoints"]
+    verbs: ["get", "list", "watch"]
+  # Đọc thông tin node (tài nguyên cluster)
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get", "list", "watch"]
+  # Đọc thông tin deployment (trạng thái rollout)
+  - apiGroups: ["apps"]
+    resources: ["deployments", "statefulsets"]
+    verbs: ["get", "list", "watch"]
+  # Đọc metrics từ metrics-server
+  - apiGroups: ["metrics.k8s.io"]
+    resources: ["pods", "nodes"]
+    verbs: ["get", "list"]
+
+---
+# ClusterRoleBinding cho ServiceAccount monitoring
+# Trong production, thay "monitoring-sa" bằng SA thực tế của Prometheus/Grafana
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: payment-system-monitoring-binding
+  labels:
+    purpose: monitoring
+subjects:
+  - kind: ServiceAccount
+    name: monitoring-sa
+    namespace: monitoring  # Namespace của hệ thống monitoring
+roleRef:
+  kind: ClusterRole
+  name: payment-system-monitoring
+  apiGroup: rbac.authorization.k8s.io

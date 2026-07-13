@@ -1,0 +1,23 @@
+# ==============================================================================
+# SERVICE: Payment Service
+# Service ClusterIP cho dịch vụ thanh toán.
+# Chỉ API Gateway mới được phép gọi đến (qua Network Policy).
+# Payment Service KHÔNG được phép gọi trực tiếp đến Auth Service.
+# ==============================================================================
+apiVersion: v1
+kind: Service
+metadata:
+  name: payment-service-svc
+  namespace: payment-system
+  labels:
+    app: payment-service
+    tier: backend
+spec:
+  type: ClusterIP
+  selector:
+    app: payment-service
+  ports:
+    - name: http
+      port: 3002
+      targetPort: 3002
+      protocol: TCP

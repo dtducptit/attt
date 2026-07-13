@@ -1,0 +1,161 @@
+# ==============================================================================
+# STATEFULSET: PostgreSQL Database
+# Triển khai PostgreSQL dưới dạng StatefulSet (không phải Deployment) vì:
+# 1. StatefulSet đảm bảo tên pod ổn định (postgres-0, postgres-1, ...)
+# 2. PersistentVolumeClaim (PVC) được gắn cố định vào từng pod
+# 3. Thứ tự khởi động/tắt được đảm bảo (quan trọng cho DB replication)
+#
+# Bảo mật cơ sở dữ liệu:
+# - Chạy với user postgres (UID 999), KHÔNG phải root
+# - Chỉ auth-service và payment-service mới kết nối được (Network Policy)
+# - Mật khẩu từ Kubernetes Secret, không hardcode
+# - PVC để dữ liệu không bị mất khi pod restart
+# ==============================================================================
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgres
+  namespace: payment-system
+  labels:
+    app: postgres
+    tier: database
+spec:
+  # Tên service headless cho DNS resolution
+  serviceName: postgres-svc
+  # 1 replica - trong production nên dùng PostgreSQL HA (Patroni, Crunchy)
+  replicas: 1
+  selector:
+    matchLabels:
+      app: postgres
+  template:
+    metadata:
+      labels:
+        app: postgres
+        tier: database
+    spec:
+      # Không dùng ServiceAccount đặc biệt cho DB
+      automountServiceAccountToken: false
+
+      securityContext:
+        # PostgreSQL chạy với UID 999 (user postgres trong container chính thức)
+        # KHÔNG chạy root để giảm thiểu rủi ro container escape
+        runAsUser: 999
+        runAsGroup: 999
+        fsGroup: 999
+
+      containers:
+        - name: postgres
+          # Sử dụng image PostgreSQL chính thức, phiên bản cố định
+          # KHÔNG dùng :latest để tránh breaking changes
+          image: postgres:16.3-alpine
+
+          # Alpine variant nhỏ gọn hơn, ít CVE hơn
+          imagePullPolicy: IfNotPresent
+
+          ports:
+            - containerPort: 5432
+              protocol: TCP
+              name: postgresql
+
+          env:
+            # Tên database mặc định
+            - name: POSTGRES_DB
+              value: "payment_db"
+            # Thông tin đăng nhập từ Secret - KHÔNG hardcode
+            - name: POSTGRES_USER
+              valueFrom:
+                secretKeyRef:
+                  name: db-credentials
+                  key: username
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: db-credentials
+                  key: password
+            # Đường dẫn dữ liệu trên PVC
+            - name: PGDATA
+              value: "/var/lib/postgresql/data/pgdata"
+
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              cpu: 500m
+              memory: 1Gi
+
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+
+          # Liveness Probe - kiểm tra PostgreSQL còn chạy không
+          livenessProbe:
+            exec:
+              command:
+                - pg_isready
+                - -U
+                - $(POSTGRES_USER)
+                - -d
+                - $(POSTGRES_DB)
+            initialDelaySeconds: 30
+            periodSeconds: 15
+            timeoutSeconds: 5
+            failureThreshold: 3
+
+          # Readiness Probe - kiểm tra PostgreSQL sẵn sàng nhận kết nối
+          readinessProbe:
+            exec:
+              command:
+                - pg_isready
+                - -U
+                - $(POSTGRES_USER)
+                - -d
+                - $(POSTGRES_DB)
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+
+          volumeMounts:
+            # Mount PVC cho dữ liệu PostgreSQL
+            # Dữ liệu sẽ được giữ lại khi pod restart
+            - name: postgres-data
+              mountPath: /var/lib/postgresql/data
+            # Mount file cấu hình bổ sung (nếu có)
+            - name: postgres-config
+              mountPath: /etc/postgresql/postgresql.conf
+              subPath: postgresql.conf
+              readOnly: true
+
+      volumes:
+        # ConfigMap chứa cấu hình PostgreSQL tùy chỉnh
+        - name: postgres-config
+          configMap:
+            name: postgres-config
+            optional: true
+
+  # ==============================================================================
+  # PERSISTENT VOLUME CLAIM TEMPLATE
+  # Mỗi pod trong StatefulSet sẽ có PVC riêng.
+  # Dữ liệu được lưu trữ bền vững, không bị mất khi pod bị xóa/restart.
+  #
+  # Trong production, nên sử dụng:
+  # - StorageClass với encryption at rest (mã hóa dữ liệu trên disk)
+  # - Backup định kỳ với Velero hoặc pg_dump
+  # - Replication cho High Availability
+  # ==============================================================================
+  volumeClaimTemplates:
+    - metadata:
+        name: postgres-data
+        labels:
+          app: postgres
+      spec:
+        accessModes:
+          - ReadWriteOnce  # Chỉ 1 pod đọc/ghi tại 1 thời điểm
+        resources:
+          requests:
+            storage: 10Gi  # 10GB cho dữ liệu
+        # Sử dụng StorageClass hỗ trợ encryption at rest
+        # storageClassName: encrypted-ssd

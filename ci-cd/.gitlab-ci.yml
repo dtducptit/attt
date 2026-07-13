@@ -1,0 +1,443 @@
+# =============================================================================
+# GitLab CI/CD Pipeline — Hệ Thống Thanh Toán Microservice Bảo Mật Đa Tầng
+# =============================================================================
+# Nguyên tắc Shift-Left Security: Đưa kiểm tra bảo mật vào sớm nhất có thể
+# trong vòng đời phát triển phần mềm, thay vì chờ đến giai đoạn cuối.
+# Pipeline này tích hợp quét lỗ hổng (Trivy), cổng bảo mật (Security Gate),
+# và kiểm thử tự động tại MỌI giai đoạn trước khi triển khai.
+# =============================================================================
+
+# --- Biến môi trường toàn cục ---
+# Cấu hình registry, tag ảnh, mức độ nghiêm trọng quét, và namespace K8s
+variables:
+  DOCKER_REGISTRY: "${CI_REGISTRY}"                    # Registry chứa Docker image
+  IMAGE_TAG: "${CI_COMMIT_SHORT_SHA}"                  # Tag ảnh = commit SHA ngắn
+  TRIVY_SEVERITY: "CRITICAL,HIGH"                      # Mức lỗ hổng cần quét
+  K8S_NAMESPACE: "payment-system"                      # Namespace Kubernetes mặc định
+  K8S_NAMESPACE_STAGING: "payment-system-staging"      # Namespace môi trường staging
+  K8S_NAMESPACE_PRODUCTION: "payment-system-production" # Namespace môi trường production
+  DOCKER_TLS_CERTDIR: "/certs"                         # Thư mục chứng chỉ TLS cho Docker
+
+# --- Định nghĩa các giai đoạn pipeline ---
+# Shift-Left: Bảo mật được kiểm tra TRƯỚC KHI triển khai (scan → gate → deploy)
+stages:
+  - build       # Giai đoạn 1: Đóng gói Docker image
+  - test        # Giai đoạn 2: Chạy unit test
+  - scan        # Giai đoạn 3: Quét lỗ hổng bảo mật bằng Trivy
+  - gate        # Giai đoạn 4: Cổng bảo mật — chặn nếu có lỗ hổng nghiêm trọng
+  - deploy-staging    # Giai đoạn 5: Triển khai lên môi trường staging
+  - deploy-production # Giai đoạn 6: Triển khai lên production (cần duyệt thủ công)
+
+# =============================================================================
+# GIAI ĐOẠN 1: BUILD — Đóng gói Docker Image
+# =============================================================================
+# Shift-Left tại giai đoạn Build:
+# - Sử dụng multi-stage build để giảm kích thước image → giảm bề mặt tấn công
+# - Chỉ copy production dependencies → loại bỏ devDependencies có thể chứa lỗ hổng
+# - Chạy với user non-root → tuân thủ nguyên tắc Least Privilege
+# =============================================================================
+
+.build_template: &build_template
+  stage: build
+  image: docker:24-dind
+  services:
+    - docker:24-dind
+  before_script:
+    - echo "$CI_REGISTRY_PASSWORD" | docker login -u "$CI_REGISTRY_USER" --password-stdin "$DOCKER_REGISTRY"
+  script:
+    - echo "🔨 [BUILD] Đang đóng gói image ${SERVICE_NAME}..."
+    - docker build
+      --file "Dockerfiles/Dockerfile.${SERVICE_NAME}"
+      --tag "${DOCKER_REGISTRY}/${SERVICE_NAME}:${IMAGE_TAG}"
+      --tag "${DOCKER_REGISTRY}/${SERVICE_NAME}:latest"
+      --build-arg NODE_ENV=production
+      --no-cache
+      "./services/${SERVICE_NAME}"
+    - echo "📦 [BUILD] Đẩy image lên registry..."
+    - docker push "${DOCKER_REGISTRY}/${SERVICE_NAME}:${IMAGE_TAG}"
+    - docker push "${DOCKER_REGISTRY}/${SERVICE_NAME}:latest"
+    - echo "✅ [BUILD] Hoàn tất đóng gói ${SERVICE_NAME}"
+  tags:
+    - docker
+
+# Build API Gateway Service
+build-gateway:
+  <<: *build_template
+  variables:
+    SERVICE_NAME: "gateway"
+
+# Build Authentication Service
+build-auth:
+  <<: *build_template
+  variables:
+    SERVICE_NAME: "auth"
+
+# Build Payment Service
+build-payment:
+  <<: *build_template
+  variables:
+    SERVICE_NAME: "payment"
+
+# =============================================================================
+# GIAI ĐOẠN 2: TEST — Chạy Unit Test
+# =============================================================================
+# Shift-Left tại giai đoạn Test:
+# - Kiểm thử sớm giúp phát hiện lỗi logic & bảo mật trước khi merge code
+# - Bao gồm test cho JWT authentication, mã hóa AES-256-GCM, input validation
+# - Test thất bại → pipeline dừng → code không được triển khai
+# =============================================================================
+
+test-unit:
+  stage: test
+  image: node:20-alpine
+  before_script:
+    - echo "🧪 [TEST] Cài đặt dependencies cho kiểm thử..."
+    - npm ci --prefix services/gateway
+    - npm ci --prefix services/auth
+    - npm ci --prefix services/payment
+  script:
+    - echo "🧪 [TEST] Chạy unit test cho tất cả services..."
+    # Kiểm thử Authentication Service — xác thực JWT, bcrypt, phân quyền
+    - echo "--- Kiểm thử Auth Service ---"
+    - npm test --prefix services/auth -- --coverage --forceExit
+    # Kiểm thử Payment Service — mã hóa AES-256-GCM, xử lý giao dịch
+    - echo "--- Kiểm thử Payment Service ---"
+    - npm test --prefix services/payment -- --coverage --forceExit
+    # Kiểm thử Gateway Service — rate limiting, routing, middleware bảo mật
+    - echo "--- Kiểm thử Gateway Service ---"
+    - npm test --prefix services/gateway -- --coverage --forceExit
+    - echo "✅ [TEST] Tất cả unit test đã PASS"
+  coverage: '/All files[^|]*\|[^|]*\s+([\d\.]+)/'
+  artifacts:
+    when: always
+    paths:
+      - services/*/coverage/
+    reports:
+      junit:
+        - services/*/junit-report.xml
+    expire_in: 30 days
+  tags:
+    - docker
+
+# =============================================================================
+# GIAI ĐOẠN 3: SCAN — Quét Lỗ Hổng Bảo Mật bằng Trivy
+# =============================================================================
+# Shift-Left tại giai đoạn Scan:
+# - Trivy quét TOÀN BỘ image để phát hiện CVE (Common Vulnerabilities & Exposures)
+# - Quét ở mức CRITICAL và HIGH — những lỗ hổng có thể bị khai thác ngay
+# - Kết quả được lưu dưới dạng JSON artifact để phân tích ở giai đoạn Gate
+# - Phát hiện lỗ hổng TRƯỚC KHI triển khai → ngăn chặn tấn công từ gốc
+# =============================================================================
+
+.scan_template: &scan_template
+  stage: scan
+  image:
+    name: aquasec/trivy:latest
+    entrypoint: [""]
+  before_script:
+    - echo "🔍 [SCAN] Chuẩn bị quét lỗ hổng bảo mật..."
+    - trivy --version
+  script:
+    - echo "🔍 [SCAN] Quét lỗ hổng cho image ${SERVICE_NAME}..."
+    # Hiển thị kết quả dạng bảng trên console để review nhanh
+    - trivy image
+      --severity "${TRIVY_SEVERITY}"
+      --format table
+      --exit-code 0
+      "${DOCKER_REGISTRY}/${SERVICE_NAME}:${IMAGE_TAG}"
+    # Xuất báo cáo JSON chi tiết để phân tích tự động ở giai đoạn Gate
+    - trivy image
+      --severity "${TRIVY_SEVERITY}"
+      --format json
+      --output "trivy-report-${SERVICE_NAME}.json"
+      "${DOCKER_REGISTRY}/${SERVICE_NAME}:${IMAGE_TAG}"
+    - echo "✅ [SCAN] Hoàn tất quét ${SERVICE_NAME}"
+  artifacts:
+    when: always
+    paths:
+      - "trivy-report-${SERVICE_NAME}.json"
+    expire_in: 7 days
+  tags:
+    - docker
+  # Cho phép giai đoạn scan tiếp tục ngay cả khi phát hiện lỗ hổng
+  # Việc chặn/cho phép sẽ do giai đoạn Gate quyết định
+  allow_failure: false
+
+# Quét API Gateway image
+scan-gateway:
+  <<: *scan_template
+  variables:
+    SERVICE_NAME: "gateway"
+  needs:
+    - build-gateway
+
+# Quét Authentication Service image
+scan-auth:
+  <<: *scan_template
+  variables:
+    SERVICE_NAME: "auth"
+  needs:
+    - build-auth
+
+# Quét Payment Service image
+scan-payment:
+  <<: *scan_template
+  variables:
+    SERVICE_NAME: "payment"
+  needs:
+    - build-payment
+
+# =============================================================================
+# GIAI ĐOẠN 4: GATE — Cổng Bảo Mật (Security Gate)
+# =============================================================================
+# Shift-Left tại giai đoạn Gate:
+# - Đây là "người gác cổng" cuối cùng trước khi code được triển khai
+# - Phân tích kết quả Trivy JSON từ giai đoạn Scan:
+#   + Nếu có lỗ hổng CRITICAL → CHẶN pipeline (exit 1) — không được triển khai
+#   + Nếu chỉ có HIGH → CẢNH BÁO nhưng cho tiếp tục (exit 0)
+#   + Nếu không có lỗ hổng → Cho phép triển khai
+# - Nguyên tắc: Không bao giờ triển khai code có lỗ hổng nghiêm trọng
+# =============================================================================
+
+security-gate:
+  stage: gate
+  image: alpine:3.19
+  needs:
+    - scan-gateway
+    - scan-auth
+    - scan-payment
+  before_script:
+    - apk add --no-cache jq coreutils
+    - echo "🚧 [GATE] Khởi tạo cổng bảo mật..."
+  script:
+    - echo "=========================================="
+    - echo "🚧 CỔNG BẢO MẬT — SECURITY GATE"
+    - echo "=========================================="
+    - |
+      # Biến đếm tổng số lỗ hổng
+      TOTAL_CRITICAL=0
+      TOTAL_HIGH=0
+      GATE_PASSED=true
+
+      # Duyệt qua báo cáo của từng service
+      for SERVICE in gateway auth payment; do
+        REPORT="trivy-report-${SERVICE}.json"
+
+        if [ ! -f "$REPORT" ]; then
+          echo "⚠️  [GATE] Không tìm thấy báo cáo cho ${SERVICE}. Bỏ qua."
+          continue
+        fi
+
+        echo ""
+        echo "--- Phân tích: ${SERVICE} ---"
+
+        # Đếm số lỗ hổng CRITICAL từ báo cáo JSON
+        CRITICAL_COUNT=$(jq '[.Results[]? | .Vulnerabilities[]? | select(.Severity == "CRITICAL")] | length' "$REPORT" 2>/dev/null || echo 0)
+
+        # Đếm số lỗ hổng HIGH từ báo cáo JSON
+        HIGH_COUNT=$(jq '[.Results[]? | .Vulnerabilities[]? | select(.Severity == "HIGH")] | length' "$REPORT" 2>/dev/null || echo 0)
+
+        echo "  🔴 CRITICAL: ${CRITICAL_COUNT}"
+        echo "  🟠 HIGH:     ${HIGH_COUNT}"
+
+        # Liệt kê chi tiết các CVE CRITICAL nếu có
+        if [ "$CRITICAL_COUNT" -gt 0 ]; then
+          echo ""
+          echo "  📋 Danh sách CVE CRITICAL:"
+          jq -r '.Results[]? | .Vulnerabilities[]? | select(.Severity == "CRITICAL") | "    - \(.VulnerabilityID): \(.PkgName) \(.InstalledVersion) → \(.FixedVersion // "chưa có bản vá")"' "$REPORT" 2>/dev/null
+          GATE_PASSED=false
+        fi
+
+        # Liệt kê chi tiết các CVE HIGH nếu có
+        if [ "$HIGH_COUNT" -gt 0 ]; then
+          echo ""
+          echo "  📋 Danh sách CVE HIGH:"
+          jq -r '.Results[]? | .Vulnerabilities[]? | select(.Severity == "HIGH") | "    - \(.VulnerabilityID): \(.PkgName) \(.InstalledVersion)"' "$REPORT" 2>/dev/null
+        fi
+
+        TOTAL_CRITICAL=$((TOTAL_CRITICAL + CRITICAL_COUNT))
+        TOTAL_HIGH=$((TOTAL_HIGH + HIGH_COUNT))
+      done
+
+      echo ""
+      echo "=========================================="
+      echo "📊 TỔNG KẾT CỔNG BẢO MẬT"
+      echo "=========================================="
+      echo "  🔴 Tổng CRITICAL: ${TOTAL_CRITICAL}"
+      echo "  🟠 Tổng HIGH:     ${TOTAL_HIGH}"
+      echo "=========================================="
+
+      # Quyết định: CHẶN nếu có CRITICAL, CẢNH BÁO nếu chỉ có HIGH
+      if [ "$GATE_PASSED" = "false" ]; then
+        echo ""
+        echo "❌ [GATE] PIPELINE BỊ CHẶN!"
+        echo "   Lý do: Phát hiện ${TOTAL_CRITICAL} lỗ hổng CRITICAL."
+        echo "   Hành động: Cập nhật base image hoặc vá các package bị ảnh hưởng."
+        echo "   Nguyên tắc Shift-Left: Không triển khai code có lỗ hổng nghiêm trọng."
+        exit 1
+      elif [ "$TOTAL_HIGH" -gt 0 ]; then
+        echo ""
+        echo "⚠️  [GATE] CẢNH BÁO — Pipeline tiếp tục với rủi ro được chấp nhận."
+        echo "   Phát hiện ${TOTAL_HIGH} lỗ hổng HIGH. Nên xử lý trong sprint tiếp theo."
+        exit 0
+      else
+        echo ""
+        echo "✅ [GATE] PIPELINE AN TOÀN — Không phát hiện lỗ hổng CRITICAL hoặc HIGH."
+        exit 0
+      fi
+  tags:
+    - docker
+
+# =============================================================================
+# GIAI ĐOẠN 5: DEPLOY STAGING — Triển Khai Lên Môi Trường Staging
+# =============================================================================
+# Shift-Left tại giai đoạn Deploy Staging:
+# - Chỉ triển khai SAU KHI đã qua cổng bảo mật (Security Gate)
+# - Môi trường staging giống production để phát hiện vấn đề sớm
+# - Áp dụng Network Policies, RBAC, Sealed Secrets giống production
+# - Chờ rollout hoàn tất để đảm bảo service healthy trước khi tiếp tục
+# =============================================================================
+
+deploy-staging:
+  stage: deploy-staging
+  image: bitnami/kubectl:1.29
+  needs:
+    - security-gate
+    - test-unit
+  environment:
+    name: staging
+    url: https://staging.payment-system.internal
+  before_script:
+    - echo "🚀 [DEPLOY-STAGING] Chuẩn bị triển khai lên staging..."
+    - kubectl config use-context staging
+  script:
+    - echo "=========================================="
+    - echo "🚀 TRIỂN KHAI LÊN MÔI TRƯỜNG STAGING"
+    - echo "=========================================="
+
+    # Tạo namespace nếu chưa tồn tại
+    - kubectl create namespace "${K8S_NAMESPACE_STAGING}" --dry-run=client -o yaml | kubectl apply -f -
+
+    # Cập nhật image tag trong manifests
+    - echo "📝 Cập nhật image tag → ${IMAGE_TAG}..."
+    - |
+      for SERVICE in gateway auth payment; do
+        sed -i "s|image:.*${SERVICE}:.*|image: ${DOCKER_REGISTRY}/${SERVICE}:${IMAGE_TAG}|g" \
+          k8s/deployments/${SERVICE}-deployment.yaml
+      done
+
+    # Áp dụng tất cả Kubernetes manifests theo thứ tự
+    - echo "📦 Áp dụng Sealed Secrets..."
+    - kubectl apply -f k8s/secrets/ -n "${K8S_NAMESPACE_STAGING}"
+
+    - echo "📦 Áp dụng ConfigMaps..."
+    - kubectl apply -f k8s/configmaps/ -n "${K8S_NAMESPACE_STAGING}"
+
+    - echo "📦 Áp dụng Network Policies (Zero Trust)..."
+    - kubectl apply -f k8s/network-policies/ -n "${K8S_NAMESPACE_STAGING}"
+
+    - echo "📦 Áp dụng RBAC (Role-Based Access Control)..."
+    - kubectl apply -f k8s/rbac/ -n "${K8S_NAMESPACE_STAGING}"
+
+    - echo "📦 Áp dụng Services..."
+    - kubectl apply -f k8s/services/ -n "${K8S_NAMESPACE_STAGING}"
+
+    - echo "📦 Áp dụng Deployments..."
+    - kubectl apply -f k8s/deployments/ -n "${K8S_NAMESPACE_STAGING}"
+
+    # Chờ rollout hoàn tất cho từng service
+    - echo "⏳ Chờ rollout hoàn tất..."
+    - kubectl rollout status deployment/gateway -n "${K8S_NAMESPACE_STAGING}" --timeout=300s
+    - kubectl rollout status deployment/auth -n "${K8S_NAMESPACE_STAGING}" --timeout=300s
+    - kubectl rollout status deployment/payment -n "${K8S_NAMESPACE_STAGING}" --timeout=300s
+
+    # Kiểm tra trạng thái pods
+    - echo "📋 Trạng thái pods trên staging:"
+    - kubectl get pods -n "${K8S_NAMESPACE_STAGING}" -o wide
+
+    - echo "✅ [DEPLOY-STAGING] Triển khai staging thành công!"
+  tags:
+    - docker
+  only:
+    - main
+    - develop
+
+# =============================================================================
+# GIAI ĐOẠN 6: DEPLOY PRODUCTION — Triển Khai Lên Môi Trường Production
+# =============================================================================
+# Shift-Left tại giai đoạn Deploy Production:
+# - YÊU CẦU PHÊ DUYỆT THỦ CÔNG (when: manual) — đảm bảo con người kiểm tra
+#   lần cuối trước khi đưa vào production
+# - Chỉ được kích hoạt SAU KHI staging đã triển khai thành công
+# - Áp dụng rolling update để đảm bảo zero-downtime
+# - Tổng kết: Code đã qua BUILD → TEST → SCAN → GATE → STAGING → APPROVAL
+#   trước khi đến tay người dùng cuối
+# =============================================================================
+
+deploy-production:
+  stage: deploy-production
+  image: bitnami/kubectl:1.29
+  needs:
+    - deploy-staging
+  environment:
+    name: production
+    url: https://payment-system.example.com
+  # ⚠️ YÊU CẦU PHÊ DUYỆT THỦ CÔNG — Người có thẩm quyền phải bấm nút "Play"
+  when: manual
+  allow_failure: false
+  before_script:
+    - echo "🚀 [DEPLOY-PRODUCTION] Chuẩn bị triển khai lên PRODUCTION..."
+    - kubectl config use-context production
+  script:
+    - echo "=========================================="
+    - echo "🚀 TRIỂN KHAI LÊN MÔI TRƯỜNG PRODUCTION"
+    - echo "⚠️  Đã được phê duyệt bởi: ${GITLAB_USER_NAME}"
+    - echo "=========================================="
+
+    # Tạo namespace nếu chưa tồn tại
+    - kubectl create namespace "${K8S_NAMESPACE_PRODUCTION}" --dry-run=client -o yaml | kubectl apply -f -
+
+    # Cập nhật image tag trong manifests
+    - echo "📝 Cập nhật image tag → ${IMAGE_TAG}..."
+    - |
+      for SERVICE in gateway auth payment; do
+        sed -i "s|image:.*${SERVICE}:.*|image: ${DOCKER_REGISTRY}/${SERVICE}:${IMAGE_TAG}|g" \
+          k8s/deployments/${SERVICE}-deployment.yaml
+      done
+
+    # Áp dụng tất cả Kubernetes manifests
+    - echo "📦 Áp dụng Sealed Secrets..."
+    - kubectl apply -f k8s/secrets/ -n "${K8S_NAMESPACE_PRODUCTION}"
+
+    - echo "📦 Áp dụng ConfigMaps..."
+    - kubectl apply -f k8s/configmaps/ -n "${K8S_NAMESPACE_PRODUCTION}"
+
+    - echo "📦 Áp dụng Network Policies (Zero Trust)..."
+    - kubectl apply -f k8s/network-policies/ -n "${K8S_NAMESPACE_PRODUCTION}"
+
+    - echo "📦 Áp dụng RBAC..."
+    - kubectl apply -f k8s/rbac/ -n "${K8S_NAMESPACE_PRODUCTION}"
+
+    - echo "📦 Áp dụng Services..."
+    - kubectl apply -f k8s/services/ -n "${K8S_NAMESPACE_PRODUCTION}"
+
+    - echo "📦 Áp dụng Deployments (Rolling Update)..."
+    - kubectl apply -f k8s/deployments/ -n "${K8S_NAMESPACE_PRODUCTION}"
+
+    # Chờ rollout hoàn tất
+    - echo "⏳ Chờ rollout hoàn tất..."
+    - kubectl rollout status deployment/gateway -n "${K8S_NAMESPACE_PRODUCTION}" --timeout=600s
+    - kubectl rollout status deployment/auth -n "${K8S_NAMESPACE_PRODUCTION}" --timeout=600s
+    - kubectl rollout status deployment/payment -n "${K8S_NAMESPACE_PRODUCTION}" --timeout=600s
+
+    # Kiểm tra trạng thái
+    - echo "📋 Trạng thái pods trên production:"
+    - kubectl get pods -n "${K8S_NAMESPACE_PRODUCTION}" -o wide
+    - kubectl get services -n "${K8S_NAMESPACE_PRODUCTION}"
+
+    - echo "✅ [DEPLOY-PRODUCTION] Triển khai production thành công!"
+    - echo "🔗 URL: https://payment-system.example.com"
+  tags:
+    - docker
+  only:
+    - main

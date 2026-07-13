@@ -1,0 +1,27 @@
+# ==============================================================================
+# SERVICE: PostgreSQL Database
+# Service ClusterIP cho PostgreSQL - chỉ truy cập nội bộ.
+#
+# Quan trọng: Database KHÔNG BAO GIỜ được expose ra bên ngoài cluster.
+# Chỉ auth-service và payment-service mới được kết nối (Network Policy).
+# ==============================================================================
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres-svc
+  namespace: payment-system
+  labels:
+    app: postgres
+    tier: database
+spec:
+  type: ClusterIP
+  # clusterIP: None → Headless service cho StatefulSet
+  # Cho phép DNS resolution trực tiếp đến pod (postgres-0.postgres-svc)
+  clusterIP: None
+  selector:
+    app: postgres
+  ports:
+    - name: postgresql
+      port: 5432
+      targetPort: 5432
+      protocol: TCP
